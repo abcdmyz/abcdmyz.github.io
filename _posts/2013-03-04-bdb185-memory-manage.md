@@ -1,14 +1,10 @@
-title: bdb1.85源码学习笔记2_内存管理
-link: http://abcdmyz.me/?p=301
-author: jojojo
-description: 
-post_id: 301
-created: 2013/03/04 12:18:22
-created_gmt: 2013/03/04 12:18:22
-comment_status: open
-post_name: bdb1-85%e6%ba%90%e7%a0%81%e5%ad%a6%e4%b9%a0%e7%ac%94%e8%ae%b02_%e5%86%85%e5%ad%98%e7%ae%a1%e7%90%86
-status: publish
-post_type: post
+---
+layout: post
+title: "bdb1.85源码学习笔记2_内存管理"
+description: ""
+category:
+tags: []
+---
 
 # bdb1.85源码学习笔记2_内存管理
 
