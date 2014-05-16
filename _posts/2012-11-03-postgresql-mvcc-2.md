@@ -1,0 +1,20 @@
+---
+layout: post
+title: PostgreSQL MVCC (2)
+description : ""
+category :
+tags: []
+---
+
+# PostgreSQL MVCC (2)
+
+之前一直纠结cmin和cmax的问题，这次总算弄懂了。而且是在解决人生三急问题的时候想通的，果然，这种时候灵感是最多的。不要碎碎念了，进入正题。 
+
+  * **cmin & cmax**
+首先提一提上一篇说到的xmin和xmax，对于每个数据版本都有xmin和xmax，记录的是创建和删除这个版本的事务ID。那么如果在一个事务里，对某个数据版本UPDATE很多次，那么这个数据版本的xmin和xmax都相等，怎么知道这些数据版本的先后顺序呢？不过对于这个问题，又涉及另一个问题，为什么要知道顺序？我只要知道最新的哪个数据版本就可以了，以前的反正都被DELETE或者UPDATE了。其实对于这个顺序的作用，目前，我唯一知道的就是CURSOR需要。  CURSOR会从表里FETCH一些数据，如果CURSOR内的数据被事务UPDATE了，理论上，CURSOR里的数据是不会受影响的。看下面的例子。 [sql] TRUNCATE mvcc_demo; BEGIN WORK; INSERT INTO mvcc_demo VALUES (1); INSERT INTO mvcc_demo VALUES (2); INSERT INTO mvcc_demo VALUES (3); SELECT * FROM mvcc_demo; DECLARE c_mvcc_demo CURSOR FOR SELECT * FROM mvcc_demo; UPDATE mvcc_demo SET val = val * 10; SELECT * FROM mvcc_demo; FETCH ALL FROM c_mvcc_demo; COMMIT WORK; [/sql] ![](/wp-content/uploads/2012/11/cursor.png) 从结果可看出，UPDATE对CURSOR内的数据是不会有影响的。最后FECTCH CURSOR的值和一开始INSERT后SELECT的值是一样的。所以，这里就要记录下CURSOR FETCH的是哪个数据版本，但是仅靠xmin和xmax是不够的，因为在同一个事务里，这两个值是相等的。所以，需要引入cmin和cmax。这里的c表示command。cmin和cmax表示事务里创建和删除这个数据版本的statement编号。这样听起来好象没什么疑惑的，但是slice里给出了这么一个例子。 [sql] TRUNCATE mvcc_demo; BEGIN WORK; DELETE FROM mvcc_demo; DELETE FROM mvcc_demo; DELETE FROM mvcc_demo; INSERT INTO mvcc_demo VALUES (1); INSERT INTO mvcc_demo VALUES (2); INSERT INTO mvcc_demo VALUES (3); SELECT xmin, cmin, xmax, * FROM mvcc_demo; DECLARE c_mvcc_demo CURSOR FOR SELECT xmin, xmax, cmax, * FROM mvcc_demo; UPDATE mvcc_demo SET val = val * 10; SELECT xmin, cmin, xmax, * FROM mvcc_demo; FETCH ALL FROM c_mvcc_demo; SELECT t_xmin AS xmin, t_xmax::text::int8 AS xmax, t_field3::text::int8 AS cmin_cmax, (t_infomask::integer & X'0020'::integer)::bool AS is_combocid FROM heap_page_items(get_raw_page('mvcc_demo', 0)) ORDER BY 2 DESC, 3; COMMIT WORK; [/sql] ![](http://abcdmyz.me/wp-content/uploads/2012/11/cmin-cmax-slice.png)f 从结果来看，INSERT之后的SELECT的cmin是3,4,5，因为INSERT操作对应的statement就是第3,4,5个statement（这里从0开始编号）。UPDATE之后的SELECT的cmin都是6,因为UPDATE操作对应的statement就是第6个statement。因为CURSOR对数据没有任何更改，所以这里不会考虑。但是，非常奇怪的是FETCH结果中的cmin，为什么cmin变成了1,2,3？还有最后一个SELECT的结果，是mvcc_demo中的所有数据版本，为什么cmin和cmax变成了一个属性，而且为什么刚才的3,4,5变成1,2,3？ 
+
+  * **看源码去吧！**
+源码这种东西，我一向觉得无比深奥，尤其对于我这么一个菜鸟。但是cmin和cmax的问题却一直搜不到答案，关于这个slice的视频也没有细讲（也可能是我英语太差了，讲了也没听懂）。然后，就试着看看源码吧。从哪里开始看？幸亏postgreSQL的manual上关于get_raw_page和heap_page_items的解释那有这么一句话“See `src/include/storage/itemid.h` and `src/include/access/htup.h` for explanations of the fields returned.“于是就冲着这句话去看了代码，然后。。。 htup.h，看名字就能想到是heap tuple，所以里面定义的就是heap tuple的数据结构。对于每个tuple，除了记录表中的一行数据外，还有这么一个东西，tuple header，里面记录的就是数据的数据，例如每个数据版本的xmin, xmax, cmin, cmax，数据掩码等等。在htup.h一开始有一大段注释，就是对tuple header里的众多数据结构进行解释，其中就包括了cmin和cmax。然后非常尽责地给了句“ See combocid.c for more details.” 于是就奔去看combocid.c了。 
+
+  * **combocid.c**
+有好注释的源码看起来能事半功倍的，至少postgreSQL是这样。comboid.c前面又有一大段注释，介绍为什么要combo。combo的意思是联合结合。这里指的的是将cmin和cmax结合，就是只用一个属性值表示，并且使用一位掩码来表示这个属性值是否是“结合”型的。听着很绕吧？慢慢解释，希望能说清楚。 为什么用combo id呢？因为statement一定是对于一个事务内而言的，把两个不同的事务的statement拿出来做比较是没有意义的。而对于一个事务而言，这些cmin和cmax也只是在事务运行过程中是有意义的，当事务提交或者回滚了，仅有一个数据版本是有效的，事务运行过程中的cmin和cmax就变得没意义了。如果一个cmin占用32bit，那么记录cmin和cmax就要占用2个32 bit。注释中提到为了节省空间，改用一个32 bit的空间记录cmin和cmax，同时用1位掩码来记录这个空间是否是“结合型“，这样就省了一倍的空间。 那它是如何combo的呢？ 在combocid.c里有两个我认为比较重要的函数，一个是GetComboCommandId，另一个是HeapTupleHeaderAdjustCmax。GetComboCommandId的输入参数是cmin和cmax，返回值是comboid。函数里对cmin和cmax做hash，返回comboid。而且它的hash一点都不复杂，就是先到先拿comboid，comboid从零开始编号。对于每对cmin和cmax，首先看看之前是否已经有等值的cmin和cmax，如果有，直接返回comboid，如果没有，那就comboid++，然后返回。 看到这里就好象有点能解释那个0,1,2是怎么出现的了，但是，疑问又来了。中间的3,4,5怎么没有了，就直接跳到6呢？HeapTupleHeaderAdjustCmax函数正好可以解释这个。HeapTupleHeaderAdjustCmax其实就是调用GetComboCommandId，获得comboid，同时将is_combo这个掩码位设置为true。再看看谁会调用HeapTupleHeaderAdjustCmax。只有heap_delete和heap_update会调用HeapTupleHeaderAdjustCmax。也就是说insert操作是不会调用HeapTupleHeaderAdjustCmax的！那么也就不会执行GetComboCommandId！那么结果中的6是什么？！是cmin！不是combo id。而结果中的0,1,2是hash之后的combo id！其实SELECT的最后一列is_combo已经指出这一点了。 把上面罗嗦了一大堆的理一理。当一个数据版本被删除或者更新的时候，这个数据版本就有cmin和cmax了，这时候cmin和cmax就会被拿去hash变成一个combo id的形式存储，同时对应的掩码位会变成true。否则，也就是数据版本没有被删除，那么combo id这一列存储的就是cmin，并且对应的掩码位是false。 我怎么罗嗦了一大堆，原来就这么两句话就说完了？！坑爹。。。要把这个罗嗦碎碎念的习惯改一改了。
